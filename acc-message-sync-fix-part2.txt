@@ -1,0 +1,49 @@
+diff --git a/core/front.html b/core/front.html
+index b89f2d5..967e172 100644
+--- a/core/front.html
++++ b/core/front.html
+@@ -4443,6 +4443,15 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+ 
+     if(!isCurrentFeedRender(threadId, renderToken)) return;
+ 
++    let undoControls = [...$.messageFeed.querySelectorAll(".undoMessageDeleteButton")]
++      .map(el => el.parentElement)
++      .filter(el => el?.dataset.threadId === threadId.toString())
++      .map(el => ({
++        el,
++        previousMessageId: el.dataset.previousMessageId || null,
++        nextMessageId: el.dataset.nextMessageId || null,
++      }));
++
+     // these messages "don't exist yet" so we remove them and then add them back afterwards:
+     let currentlyStreamingMessages = [...$.messageFeed.querySelectorAll(".message")].filter(el => el.dataset.currentlyStreaming).map(el => {
+       let prevMessage = el.previousElementSibling;
+@@ -4473,6 +4482,16 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       $.messageFeed.appendChild(el);
+     }
+ 
++    for(let undo of undoControls) {
++      if(undo.el.isConnected) continue;
++      let messageEls = [...$.messageFeed.querySelectorAll(".message")];
++      let previousMessageEl = messageEls.find(el => el.dataset.id === undo.previousMessageId);
++      let nextMessageEl = messageEls.find(el => el.dataset.id === undo.nextMessageId);
++      if(previousMessageEl) previousMessageEl.after(undo.el);
++      else if(nextMessageEl) nextMessageEl.before(undo.el);
++      else $.messageFeed.append(undo.el);
++    }
++
+     for(let {prevMessageId, el} of currentlyStreamingMessages) {
+       let prevMessage = (prevMessageId === null) ? null : $.messageFeed.querySelector(`.message[data-id='${prevMessageId}']`);
+       if(prevMessage) prevMessage.after(el);
+@@ -10295,6 +10314,11 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     }
+ 
+     let undoBtn = document.createElement("div");
++    let nextMessageEl = messageEl.nextElementSibling;
++    while(nextMessageEl && !nextMessageEl.classList.contains("message")) nextMessageEl = nextMessageEl.nextElementSibling;
++    undoBtn.dataset.threadId = threadId;
++    undoBtn.dataset.previousMessageId = prevMessageEl?.dataset.id ?? "";
++    undoBtn.dataset.nextMessageId = nextMessageEl?.dataset.id ?? "";
+     undoBtn.innerHTML = `<div class="undoMessageDeleteButton" style="text-align:center;"><button>undo deletion</button></div>`;
+     undoBtn.querySelector("button").addEventListener("click", async function() {
+       // add message back to db.

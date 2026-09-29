@@ -1,0 +1,328 @@
+diff --git a/core/front.html b/core/front.html
+index 752da99..b89f2d5 100644
+--- a/core/front.html
++++ b/core/front.html
+@@ -4272,7 +4272,49 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+   // Given a threadId, this renders the message feed for that thread in the middle column.
+   const numMessagesPerDisplayBatch = 50;
+   let previouslyRenderedMessageFeedThreadId = null;
++  const messageListStates = new Map();
++  function getMessageListState(threadId) {
++    if(!messageListStates.has(threadId)) {
++      messageListStates.set(threadId, {
++        canonicalRevision: 0,
++        renderInvalidationEpoch: 0,
++        renderGeneration: 0,
++        mutationTail: Promise.resolve(),
++      });
++    }
++    return messageListStates.get(threadId);
++  }
++  async function commitMessageListMutation(threadId, mutation) {
++    let state = getMessageListState(threadId);
++    let release;
++    let previousMutation = state.mutationTail;
++    state.mutationTail = new Promise(resolve => release = resolve);
++    await previousMutation;
++    state.renderInvalidationEpoch++;
++    try {
++      let result = await mutation();
++      if(result.changed) state.canonicalRevision++;
++      return {...result, canonicalRevision:state.canonicalRevision};
++    } finally {
++      release();
++    }
++  }
++  function beginFeedRender(threadId) {
++    let state = getMessageListState(threadId);
++    return {
++      canonicalRevision: state.canonicalRevision,
++      invalidationEpoch: state.renderInvalidationEpoch,
++      generation: ++state.renderGeneration,
++    };
++  }
++  function isCurrentFeedRender(threadId, token) {
++    let state = getMessageListState(threadId);
++    return state.canonicalRevision === token.canonicalRevision
++      && state.renderInvalidationEpoch === token.invalidationEpoch
++      && state.renderGeneration === token.generation;
++  }
+   async function renderMessageFeed(threadId, opts={}) {
++    let renderToken = beginFeedRender(threadId);
+     let thread = (await db.threads.where("id").equals(threadId).toArray())[0];
+     if(!thread) {
+       console.error("!thread in renderMessageFeed");
+@@ -4399,6 +4441,8 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     // Since this is async, it should come *before* HTML modification, since we want that to be "instant", especially due to other things potentially referencing e.g. currentlyStreamingMessages elements - i.e. we don't want code that expects the message feed to be rendered properly to execute in between deletion and creation.
+     let messageElsToAdd = await Promise.all(messagesWeNeedToAdd.map(m => createMessageElement(m, {character:characterIdToCharacterObj[m.characterId], thread, threadCharacter, userCharacter, characterIdToCharacterObj})));
+ 
++    if(!isCurrentFeedRender(threadId, renderToken)) return;
++
+     // these messages "don't exist yet" so we remove them and then add them back afterwards:
+     let currentlyStreamingMessages = [...$.messageFeed.querySelectorAll(".message")].filter(el => el.dataset.currentlyStreaming).map(el => {
+       let prevMessage = el.previousElementSibling;
+@@ -6753,7 +6797,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       messageObj.order = messages.length > 0 ? messages.at(-1).order + 1 : 0;
+     }
+ 
+-    let id = await db.messages.add(messageObj);
++    let {id} = await commitMessageListMutation(messageObj.threadId, async () => ({
++      changed: true,
++      id: await db.messages.add(messageObj),
++    }));
+     // update the thread's lastMessageTime.
+     await db.threads.update(messageObj.threadId, { lastMessageTime: messageObj.creationTime });
+     // if this thread isn't at the top of the thread list, re-render the thread list
+@@ -9057,7 +9104,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+         if(isMobile) showEl(newMessageEl.querySelector(".messageVariantsCtn"));
+ 
+         // update db with bot's reply
+-        await db.messages.put(messageObj);
++        await commitMessageListMutation(threadId, async () => {
++          await db.messages.put(messageObj);
++          return {changed:true};
++        });
+         // update thread's lastMessageTime
+         await db.threads.update(threadId, { lastMessageTime: Date.now() });
+ 
+@@ -9167,7 +9217,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       if(currentIndex-1 < 0) currentIndex = message.variants.length;
+       message.message = message.variants[currentIndex-1];
+       message.variants[currentIndex-1] = null;
+-      await db.messages.put(message);
++      await commitMessageListMutation(message.threadId, async () => {
++        await db.messages.put(message);
++        return {changed:true};
++      });
+       let newMessageEl = await addMessageToFeed(message, {inPlaceOf:messageEl, showVariantsSelector:true});
+       newMessageEl.querySelector(".currentVariantNumber").innerHTML = `${(currentIndex-1) + 1}<span style="opacity:0.5">/${message.variants.length}</span>`; // +1 because 1-indexed
+     } else if(nextOrPrevious === "next") {
+@@ -9177,7 +9230,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       if(currentIndex+1 >= message.variants.length) currentIndex = -1;
+       message.message = message.variants[currentIndex+1];
+       message.variants[currentIndex+1] = null;
+-      await db.messages.put(message);
++      await commitMessageListMutation(message.threadId, async () => {
++        await db.messages.put(message);
++        return {changed:true};
++      });
+       let newMessageEl = await addMessageToFeed(message, {inPlaceOf:messageEl, showVariantsSelector:true});
+       newMessageEl.querySelector(".currentVariantNumber").innerHTML = `${(currentIndex+1) + 1}<span style="opacity:0.5">/${message.variants.length}</span>`; // +1 because 1-indexed
+     } else {
+@@ -10102,7 +10158,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     result.hiddenFrom = result.hiddenFrom.split(",").filter(x => x);
+     if(!result.instruction || !result.instruction.trim()) result.instruction = null;
+ 
+-    await db.messages.update(messageId, result);
++    await commitMessageListMutation(threadId, async () => {
++      if(await db.messages.update(messageId, result) !== 1) throw new Error(`Message ${messageId} was not updated.`);
++      return {changed:true};
++    });
+ 
+     let newMessage = await db.messages.get(messageId);
+ 
+@@ -10195,7 +10254,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       return;
+     }
+ 
+-    await db.messages.update(messageId, {message:newMessageContent});
++    await commitMessageListMutation(threadId, async () => {
++      if(await db.messages.update(messageId, {message:newMessageContent}) !== 1) throw new Error(`Message ${messageId} was not updated.`);
++      return {changed:true};
++    });
+ 
+     let newMessage = await db.messages.get(messageId);
+ 
+@@ -10237,7 +10299,13 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     undoBtn.querySelector("button").addEventListener("click", async function() {
+       // add message back to db.
+       // NOTE: the message will no longer be referenced in messageIdsUsed of other messages (due to safelyDeleteMessagesByIds tidying up those references), but that's not a big deal. Can improve this later if needed - TODO
+-      await db.messages.add(messageObj);
++      let commit = await commitMessageListMutation(threadId, async () => {
++        await db.transaction('rw', db.messages, async tx => {
++          await tx.table("messages").add(messageObj);
++        });
++        return {changed:true};
++      });
++      await syncCanonicalMessagesToCustomCodeIframe(threadId, commit.canonicalRevision);
+ 
+       let opts = {};
+       if(prevMessageEl) opts.insertAfter = prevMessageEl;
+@@ -10249,7 +10317,12 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       await updateThreadScene();
+     });
+ 
+-    await safelyDeleteMessagesByIds([messageId]);
++    await commitMessageListMutation(threadId, async () => {
++      await db.transaction('rw', db.messages, async tx => {
++        await safelyDeleteMessagesByIds([messageId], {tx});
++      });
++      return {changed:true};
++    });
+     messageEl.replaceWith(undoBtn);
+     if(!$.messageFeed.querySelector(".message")) {
+       showEl($.noMessagesNotice);
+@@ -11727,6 +11800,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+         };
+         let dataChangedByCustomCode = false;
+         let dataSnapshotWhenLastSentToMainThread = null;
++        let canonicalMessageListRevision = 0;
+ 
+         window.oc = {
+           thread: Object.seal({
+@@ -11976,7 +12050,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+             let changedData = getChangedData();
+             dataChangedByCustomCode = false;
+             dataSnapshotWhenLastSentToMainThread = getCurrentData();
+-            await callParentWindow({type:"dataChanged", data:changedData})
++            await callParentWindow({type:"dataChanged", data:changedData, sourceMessageListRevision:canonicalMessageListRevision})
+           }
+         }
+ 
+@@ -12004,7 +12078,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+ 
+         window.addEventListener("message", async function(e) {
+           if(e.source !== window.parent || e.origin !== "${window.location.origin}") return;
+-          if(!e.data._id) return;
++          if(!e.data._id && e.data.type !== "syncMessages") return;
+           if(window.oc !== originalOcObject) {
+             // oc is frozen and oc.character/thread are sealed, but they can still overwrite window.oc - however, this is a security issue, since oc gets JSONified and sent back to the main thread when data changes, and I don't want to have to deal with unexpected properties on the main thread because it could be dangerous
+             window.parent.postMessage({_id:e.data._id, success:false, result:"oc has been modified. Please do not modify window.oc."}, "${window.location.origin}");
+@@ -12036,6 +12110,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+               try {
+                 let updates = e.data.data.updates;
+                 let eventData = e.data.data.eventData;
++                canonicalMessageListRevision = e.data.data.canonicalMessageListRevision ?? canonicalMessageListRevision;
+ 
+                 let userFacingEventData = {};
+ 
+@@ -12149,6 +12224,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+             let data = e.data.initialData;
+             applyObjectOverrides({object:oc.thread, overrides:data.thread});
+             applyObjectOverrides({object:oc.character, overrides:data.character});
++            canonicalMessageListRevision = e.data.canonicalMessageListRevision ?? 0;
+ 
+             window.___dataInitializationFINISHED_836283628 = true;
+             dataChangedByCustomCode = false;
+@@ -12171,6 +12247,13 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+             }
+             window.parent.postMessage({_id:e.data._id, success:true, result:null}, "${window.location.origin}");
+           }
++
++          if(e.data.type === "syncMessages") {
++            oc.thread.messages = structuredClone(e.data.messages);
++            dataSnapshotWhenLastSentToMainThread = getCurrentData();
++            canonicalMessageListRevision = e.data.canonicalMessageListRevision;
++            dataChangedByCustomCode = false;
++          }
+         });
+       })();
+ 
+@@ -12472,7 +12555,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+ 
+       if(data.type === "dataChanged") {
+         let receivedData = data.data;
+-        await updateDbWithNewDataFromCustomCode({threadId, receivedData});
++        await updateDbWithNewDataFromCustomCode({threadId, receivedData, sourceMessageListRevision:data.sourceMessageListRevision});
+         if(threadId === activeThreadId) {
+           await renderMessageFeed(threadId);
+ 
+@@ -12522,6 +12605,7 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+   };
+ 
+   async function getDataForCustomCode(threadId, opts={}) {
++    let sourceMessageListRevision = getMessageListState(threadId).canonicalRevision;
+     let thread = opts.thread;
+     if(!thread) {
+       thread = await db.threads.get(threadId);
+@@ -12557,12 +12641,12 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     // backwards-compat properties:
+     data.character.avatarUrl = threadCharacter.avatar.url;
+ 
+-    return {data, originalMessages:messages};
++    return {data, originalMessages:messages, sourceMessageListRevision};
+   }
+ 
+   async function triggerInitCustomCodeEvent(threadId) {
+-    let {data, originalMessages} = await getDataForCustomCode(threadId, {});
+-    await sendCustomCodeIframeMessage(threadId, {type:"init", initialData:data});
++    let {data, sourceMessageListRevision} = await getDataForCustomCode(threadId, {});
++    await sendCustomCodeIframeMessage(threadId, {type:"init", initialData:data, canonicalMessageListRevision:sourceMessageListRevision});
+   }
+   // this function runs after every message is added: https://rentry.org/82hwif
+   async function triggerMessageActionCustomCodeEvent({threadId, eventData, eventName, triggerBotReply=true}={}) {
+@@ -12574,10 +12658,10 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     $.statusNotifier.innerHTML = "<span style='opacity: 0.6; font-size: 0.9rem;'>⌛ custom code processing</span><div style='width:0.5rem;'></div>"+createTypingIndicatorHtml();
+     showEl($.statusNotifier);
+ 
+-    let { data, originalMessages } = await getDataForCustomCode(threadId, {thread, threadCharacter});
++    let { data, originalMessages, sourceMessageListRevision } = await getDataForCustomCode(threadId, {thread, threadCharacter});
+     let updates = data;
+-    let receivedData = await sendCustomCodeIframeMessage(threadId, {type:"event", eventName:eventName.toLowerCase(), data:{updates, eventData}});
+-    if(receivedData) await updateDbWithNewDataFromCustomCode({threadId, receivedData, originalMessages});
++    let receivedData = await sendCustomCodeIframeMessage(threadId, {type:"event", eventName:eventName.toLowerCase(), data:{updates, eventData, canonicalMessageListRevision:sourceMessageListRevision}});
++    if(receivedData) await updateDbWithNewDataFromCustomCode({threadId, receivedData, originalMessages, sourceMessageListRevision});
+     $.statusNotifier.innerHTML = "";
+     hideEl($.statusNotifier);
+ 
+@@ -12592,7 +12676,18 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+     await sendCustomCodeIframeMessage(threadId, {type:"event", eventName:"streamingmessagechunk", data:chunkData});
+   }
+ 
+-  async function updateDbWithNewDataFromCustomCode({threadId, receivedData, originalMessages}) {
++  async function syncCanonicalMessagesToCustomCodeIframe(threadId, canonicalMessageListRevision) {
++    if(!customCodeIframes[threadId]) return;
++    let dataForCustomCode = await getDataForCustomCode(threadId, {});
++    if(!dataForCustomCode) return;
++    customCodeIframes[threadId].contentWindow.postMessage({
++      type:"syncMessages",
++      messages:dataForCustomCode.data.thread.messages,
++      canonicalMessageListRevision,
++    }, "*");
++  }
++
++  async function updateDbWithNewDataFromCustomCode({threadId, receivedData, originalMessages, sourceMessageListRevision}) {
+ 
+     // backwards-compat:
+     if(receivedData.character?.avatarUrl) {
+@@ -12652,20 +12747,30 @@ window.maxMessagesButtonModify = maxMessagesButtonModify;
+       // replace messages in the database with the new messages
+       // we need to make sure that no other db.messages code runs between .delete and .bulkAdd, so we use a transaction that gets a read-write lock on the messages table.
+       // otherwise e.g. another call to updateDbWithNewDataFromCustomCode could run between them, and that would cause `db.messages.where("threadId").equals(threadId).toArray()` to incorrectly return zero messages.
+-      await db.transaction('rw', db.messages, async (tx) => {
+-        let existingMessageIds = await tx.table("messages").where("threadId").equals(threadId).toArray().then(arr => arr.map(m => m.id));
+-        await safelyDeleteMessagesByIds(existingMessageIds, {tx});
+-
+-        let ids = outputMessageObjs.filter(m => m.id !== undefined).map(m => m.id);
+-        if(new Set(ids).size !== ids.length) {
+-          throw new Error("Duplicate message ids after custom code processing. This is a bug.");
++      let messageCommit = await commitMessageListMutation(threadId, async () => {
++        if(sourceMessageListRevision !== undefined && sourceMessageListRevision !== getMessageListState(threadId).canonicalRevision) {
++          return {changed:false, staleMessageUpdate:true};
+         }
++        await db.transaction('rw', db.messages, async (tx) => {
++          let existingMessageIds = await tx.table("messages").where("threadId").equals(threadId).toArray().then(arr => arr.map(m => m.id));
++          await safelyDeleteMessagesByIds(existingMessageIds, {tx});
++
++          let ids = outputMessageObjs.filter(m => m.id !== undefined).map(m => m.id);
++          if(new Set(ids).size !== ids.length) {
++            throw new Error("Duplicate message ids after custom code processing. This is a bug.");
++          }
+ 
+-        await tx.table("messages").bulkAdd(outputMessageObjs).catch(e => {
+-          console.error("There was an error during custom code handling - updateDbWithNewDataFromCustomCode:", e);
+-          alert("There was an error during custom code handling - updateDbWithNewDataFromCustomCode.\n\n"+e.stack);
++          try {
++            await tx.table("messages").bulkAdd(outputMessageObjs);
++          } catch(e) {
++            console.error("There was an error during custom code handling - updateDbWithNewDataFromCustomCode:", e);
++            alert("There was an error during custom code handling - updateDbWithNewDataFromCustomCode.\n\n"+e.stack);
++            throw e;
++          }
+         });
++        return {changed:true};
+       });
++      await syncCanonicalMessagesToCustomCodeIframe(threadId, messageCommit.canonicalRevision);
+       // let newMessages = await db.messages.where("threadId").equals(threadId).toArray();
+       // debugger;
+     }
